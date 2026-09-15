@@ -1,57 +1,45 @@
-# PR (DRAFT): CHARM embedding anomaly detector — best read-out + μ/σ, supervised + zero-shot
+# PR (DRAFT): CHARM embedding anomaly detector — multiscale (best), + zero-shot
 
-Successor to the original `Run_CHARM.py` (PR #56). Same TSB-AD `benchmark_exp/` convention
-(standalone runner + per-dataset VUS-PR tables), upgraded with the best read-out and the
-μ/σ ensemble from an embedding-extraction study, plus a multivariate no-channel-pooling variant.
+Successor to the original `Run_CHARM.py` (PR #56). Two detectors.
 
 ## Detectors (`Run_CHARM.py`)
-**Semi-supervised** (clean train split):
-- **`CHARM_kNN`** *(best overall)* — L5 max-over-time / **mean-over-channel** embedding
-  cosine-kNN to clean-train windows, ensembled with a per-window `[std,range,max,min,mean]`
-  L2-kNN: `norm(emb) + 0.35·norm(stats)` (min-max).
-- **`CHARM_kNN_nopool`** *(best on multivariate; use when channel count is high)* — same, but
-  the embedding read-out does **not pool channels** (adaptive: per-channel cosine max-fused for
-  C≤20, else concat + per-dimension standardize), ensembled with μ/σ by **z-score-sum**
-  (parameter-free).
+- **`CHARM_kNN`** (semi-supervised, best overall) — **multiscale**. Two sub-detectors,
+  each run at several window sizes, z-scored per scale, combined by **element-wise MAX
+  across scales** ("anomalous at ANY scale" beats averaging, which dilutes a signal that
+  only shows up at one window length):
+  - embedding: mean-pool-channel cosine-kNN, windows **{64,128,256}**
+  - statistics: per-window `[std,range,max,min,mean]` L2-kNN, windows **{16,32,64,128,256,512}**
+    (single scale 128 only for multivariate with channel count ≤3 — extra scales add noise there)
+  - `final = max_scales(z(embedding)) + max_scales(z(statistics))`
+- **`CHARM_ZS`** (zero-shot, no train reference) — bootstrap-kNN (IsolationForest picks a
+  pseudo-clean reference from the series itself) ensembled with per-window std, z-score-sum.
 
-**Unsupervised / zero-shot** (no train reference):
-- **`CHARM_ZS`** — bootstrap-kNN (IsolationForest picks a pseudo-clean reference from the series
-  itself) ensembled with per-window `std`: `norm(bknn) + 0.4·norm(std)`.
+## Results — VUS-PR, TSB-AD eval, stride-1, official protocol (350 uni / 180 mv / 530 all, 0 errors)
+| detector | uni | mv | all |
+|---|---|---|---|
+| **CHARM_kNN** | **0.680** | **0.543** | **0.634** |
+| CHARM_ZS | 0.615 | 0.463 | 0.560 |
+| *(original Run_CHARM, last-layer mean, no μ/σ)* | — | — | ~0.499 |
 
-## Why μ/σ + read-out
-The original `Run_CHARM.py` used `aggregate=True` (last-layer mean over patches **and** channels).
-This uses `aggregate=False` and pools client-side as **max over time-patches** on **L5**. The
-encoder instance-normalizes each window, erasing amplitude / level-shift anomalies from the
-embedding; the per-window statistics (no model call) recover them (**~+7 pp VUS-PR**). Combine
-the two detectors by normalizing each and adding.
+`CHARM_kNN` is **+2.6pp over the single-scale recipe** and **+12.7pp over the original
+baseline**. Z-scoring each scale before the max is not optional — skipping it costs ~6pp
+(raw-score max-pooling across scales collapses without it). A channel-count-adaptive
+embedding read-out (per-channel pooling for few channels) was re-tested in this multiscale
+setting and no longer helps — plain mean-pooling ties or beats it everywhere once
+multiscale statistics is already catching scale-localized anomalies, so the recipe above
+needs no channel-count branching at all.
 
-## Results — VUS-PR, TSB-AD eval, **stride-1**, official protocol (350 uni / 180 mv / 530 all)
-| detector | regime | uni | mv | all |
-|---|---|---|---|---|
-| **CHARM_kNN** | semi | **0.659** | 0.506 | **0.607** |
-| **CHARM_kNN_nopool** | semi (high-C) | 0.645 | **0.515** | 0.601 |
-| **CHARM_ZS** | zero-shot | 0.615 | 0.463 | 0.560 |
-| *(orig Run_CHARM, last-layer mean, no μ/σ)* | semi | — | — | ~0.499 |
-
-Per-dataset tables: `benchmark_eval_results/CHARM_{uni,multi}_mergedTable_VUS-PR.csv`.
-
-**Notes on the variants.** `CHARM_kNN` (min-max ensemble) is the best on the overall leaderboard.
-Not pooling channels helps **only on multivariate** (and grows with channel count — negligible at
-C≤3, sizeable at C≥20, large at C>60); since univariate is 66% of the eval, `CHARM_kNN_nopool` is
-slightly below on "all" but ahead on mv, so it is offered as the recommended detector **when the
-channel count is high**. A parameter-free **z-score-sum** combiner matches min-max on "all" (0.602)
-and wins on mv — it is what `CHARM_kNN_nopool` uses.
-
-## Provenance / one remaining step
-Numbers were regenerated with the L5 read-out from the CHARM checkpoint that will back the served
-model (the served endpoint must expose `aggregate=False` → L5 per-patch/per-channel; tmax/channel
-pooling is client-side in the runner). The scoring metric was verified **bit-exact** against
-TSB-AD's `get_metrics` VUS-PR. Serving the L5 read-out is the only outstanding step.
+## Provenance
+Read-out is CHARM's L5 block via `aggregate=False` (client-side max-over-time, mean-over-channel
+pooling). Numbers were produced with the checkpoint that will back the served `CHARM_kNN`/`CHARM_ZS`
+model; serving that endpoint is the only outstanding step. Metric verified bit-exact against
+TSB-AD's `get_metrics` VUS-PR.
 
 ## How to run
 ```
 python Run_CHARM.py --filename <ds>.csv --data_dir Datasets/TSB-AD-M/ --model CHARM_kNN
-# --model CHARM_kNN_nopool  (multivariate, high channel count)
-# --model CHARM_ZS          (zero-shot)
+# --model CHARM_ZS   (zero-shot)
 ```
-Env: `CHARM_BASE_URL`, `CHARM_API_KEY`; `pip install c3-charm`.
+Env: `CHARM_BASE_URL`, `CHARM_API_KEY`; `pip install c3-charm`. Note: `CHARM_kNN` calls the
+embedding endpoint at 3 window sizes per series (more requests than a single-scale recipe) —
+worth it for the accuracy gain, but budget for ~3x the API calls of a single-scale detector.
