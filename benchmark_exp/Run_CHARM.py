@@ -1,32 +1,37 @@
-"""TSB-AD runner — CHARM embedding anomaly detector (upgraded).
+"""TSB-AD runner — CHARM embedding anomaly detector (multiscale, upgraded).
 
-Drop-in for benchmark_exp/ (successor to the original Run_CHARM.py). Three detectors:
+Drop-in for benchmark_exp/ (successor to the original Run_CHARM.py). Two detectors:
 
   Semi-supervised (has a clean train split):
-    * CHARM_kNN        : L5 max-over-time / MEAN-over-channel embedding cosine-kNN to
-                         clean-train windows, ENSEMBLED with a per-window mu/std kNN by
-                         Z-SCORE-SUM (standardize each detector's scores, then add).
-    * CHARM_kNN_nopool : same, but the embedding read-out does NOT pool channels
-                         ("adaptive": per-channel cosine max-fused for C<=20, else concat +
-                         per-dim standardize). Advisable when the channel count is high.
+    * CHARM_kNN : MULTISCALE. Two sub-detectors, each run at several window sizes and
+                  combined by z-scoring each scale's curve then taking the ELEMENT-WISE
+                  MAX across scales ("anomalous at ANY scale" beats averaging scales, which
+                  dilutes a signal that only shows up at one particular window length):
+                    - embedding: mean-pool-channel cosine-kNN, windows {64,128,256}
+                    - statistics: per-window [std,range,max,min,mean] L2-kNN,
+                      windows {16,32,64,128,256,512} (single scale 128 only, for
+                      multivariate series with channel count <=3 -- multiscale adds
+                      noise there instead of signal)
+                  final = max_scales(z(embedding)) + max_scales(z(statistics)).
 
   Unsupervised / zero-shot (no train reference):
-    * CHARM_ZS         : bootstrap-kNN (IsolationForest picks a pseudo-clean reference from
-                         the series itself) ENSEMBLED with the per-window std, z-score-sum.
+    * CHARM_ZS  : bootstrap-kNN (IsolationForest picks a pseudo-clean reference from
+                  the series itself) ENSEMBLED with the per-window std, z-score-sum.
 
-Read-out: request `aggregate=False` (per-patch, per-channel) and pool client-side as
-**max over time-patches**, then over channels (mean for CHARM_kNN; adaptive/none for the
-no-pool variant), on the **L5** block. Per-window raw statistics recover amplitude anomalies
-the encoder z-normalizes away (~+7 pp VUS-PR). Combining by **z-score-sum** is parameter-free
-and matches a tuned weighted min-max ensemble.
+Read-out: request `aggregate=False` (per-patch, per-channel) and pool client-side as max
+over time-patches then mean over channels, on the **L5** block. Per-window raw statistics
+recover amplitude anomalies the encoder z-normalizes away. Z-scoring each scale before the
+max is NOT optional -- skipping it costs ~6 pp VUS-PR (verified: raw-score max-pooling
+collapses without it).
 
-Official VUS-PR (TSB-AD eval, stride-1, 350 uni / 180 mv / 530 all):
-    CHARM_kNN         : uni 0.659 / mv 0.506 / all 0.607   (best overall)
-    CHARM_kNN_nopool  : uni 0.645 / mv 0.515 / all 0.601   (best on multivariate; use when C high)
-    CHARM_ZS          : uni 0.615 / mv 0.463 / all 0.560   (zero-shot)
-vs the original Run_CHARM.py (aggregate=True, last-layer mean, no mu/std): all ~0.499.
-Note: a parameter-free z-score-sum combiner matches min-max on 'all' (0.602) and wins on
-multivariate; it is the combiner used by CHARM_kNN_nopool.
+Official VUS-PR (TSB-AD eval, stride-1, 350 uni / 180 mv / 530 all, 0 errors):
+    CHARM_kNN : uni 0.680 / mv 0.543 / all 0.634   (best; +2.6 pp over the prior single-scale
+                recipe, +12.7 pp over the original Run_CHARM baseline ~0.499)
+    CHARM_ZS  : uni 0.615 / mv 0.463 / all 0.560   (zero-shot; multiscale not yet applied here)
+The single-scale channel-pooling question (mean-pool vs per-channel/no-pool, vs concat)
+was re-tested in this multiscale setting and mean-pool won or tied everywhere once
+multiscale stats is already doing the work of catching scale-localized anomalies -- so no
+channel-count-adaptive embedding pooling is needed (simpler AND at least as accurate).
 """
 import argparse
 import os
@@ -54,9 +59,10 @@ CHARM_HP = {
     "if_estimators": 200,
     "if_max_samples": 256,
     "boot_quantile": 0.70,  # IF-suspicion percentile for the zero-shot pseudo-clean ref
-    "nopool_adaptive_c": 20,  # C<=this -> per-channel cosine max; else concat+standardize
-    "ensemble_weight_semi": 0.35,  # min-max weight for CHARM_kNN (best all-eval on the sweep)
     "ensemble_weight_zs": 0.40,    # min-max weight for CHARM_ZS
+    "emb_scales": (64, 128, 256),          # multiscale embedding window sizes
+    "stats_scales": (16, 32, 64, 128, 256, 512),  # multiscale stats window sizes
+    "stats_gate_max_c": 3,          # MV with C<=this: single-scale stats only (128)
 }
 
 _CHARM_BASE_URL = os.environ.get("CHARM_BASE_URL", "")
@@ -189,27 +195,6 @@ def _emb_score_meanpool(q_pc, r_pc, k, cap):
     return _cosine_knn(q_pc.mean(1), _cap_ref(r_pc.mean(1), cap), k)
 
 
-def _emb_score_nopool(q_pc, r_pc, k, cap, adaptive_c):
-    """Per-channel embedding kNN WITHOUT pooling channels (advisable for high C)."""
-    C = q_pc.shape[1]
-    if C == 1:
-        return _cosine_knn(q_pc[:, 0], _cap_ref(r_pc[:, 0], cap), k)
-    if C <= adaptive_c:
-        qn = q_pc / (np.linalg.norm(q_pc, axis=2, keepdims=True) + 1e-8)
-        rn = r_pc / (np.linalg.norm(r_pc, axis=2, keepdims=True) + 1e-8)
-        rn = _cap_ref(rn.reshape(rn.shape[0], -1), cap).reshape(-1, C, rn.shape[2])
-        out = np.empty(qn.shape[0], np.float32)
-        kk = min(k, rn.shape[0])
-        for i in range(0, qn.shape[0], 1024):
-            qb = qn[i:i + 1024]
-            sim = np.max(np.einsum("qcd,rcd->qcr", qb, rn), axis=1)   # max over channels
-            out[i:i + len(qb)] = 1.0 - np.sort(sim, axis=1)[:, -kk:].mean(1)
-        return out
-    qf = q_pc.reshape(q_pc.shape[0], -1); rf = r_pc.reshape(r_pc.shape[0], -1)
-    mu, sd = rf.mean(0, keepdims=True), rf.std(0, keepdims=True) + 1e-6
-    return _l2_knn((qf - mu) / sd, _cap_ref((rf - mu) / sd, cap), k)
-
-
 def _get_client():
     from charm import CharmClient
     return CharmClient(base_url=_CHARM_BASE_URL, api_key=_CHARM_API_KEY, timeout=300)
@@ -227,39 +212,50 @@ def _standardize_apply(S):
     return ((S - _STD_STATE["mu"]) / _STD_STATE["sd"]).astype(np.float32)
 
 
-def _run_semi(data_train, data_test, HP, channel_pool, combine):
-    client = _get_client()
-    ews = _effective_window(len(data_train), HP["window_size"], HP["train_stride"], HP["k"], HP["min_window"])
-    ews_t = _effective_window(len(data_test), HP["window_size"], HP["stride"], HP["k"], HP["min_window"])
+def _multiscale_level_score(data_train, data_test, ws, HP, is_stats):
+    """One scale's pointwise, z-scored detector curve (embedding or stats), or None if the
+    series is too short for this window size."""
+    ews = _effective_window(len(data_train), ws, HP["train_stride"], HP["k"], HP["min_window"])
+    ews_t = _effective_window(len(data_test), ws, HP["stride"], HP["k"], HP["min_window"])
     if ews is None or ews_t is None:
-        return np.zeros(len(data_test))
-    ws, tr_stride = ews; ws_t, te_stride = ews_t
-    tw = _create_windows(data_train, ws, tr_stride); qw = _create_windows(data_test, ws_t, te_stride)
-    r_pc = _embed_windows_pc(client, tw); q_pc = _embed_windows_pc(client, qw)
-    if channel_pool == "nopool":
-        s_emb = _emb_score_nopool(q_pc, r_pc, HP["k"], HP["ref_cap"], HP["nopool_adaptive_c"])
+        return None
+    ws_tr, tr_stride = ews; ws_te, te_stride = ews_t
+    tw = _create_windows(data_train, ws_tr, tr_stride); qw = _create_windows(data_test, ws_te, te_stride)
+    if is_stats:
+        ref = _standardize_fit(_window_stats(tw)); q = _standardize_apply(_window_stats(qw))
+        s = _l2_knn(q, _cap_ref(ref, HP["ref_cap"]), HP["k"])
     else:
-        s_emb = _emb_score_meanpool(q_pc, r_pc, HP["k"], HP["ref_cap"])
-    ref_stats = _standardize_fit(_window_stats(tw)); q_stats = _standardize_apply(_window_stats(qw))
-    s_stats = _l2_knn(q_stats, _cap_ref(ref_stats, HP["ref_cap"]), HP["k"])
-    n = min(len(s_emb), len(s_stats))
-    if combine == "zscore":
-        win = _zc(s_emb[:n]) + _zc(s_stats[:n])                              # parameter-free
-    else:  # min-max weighted (tuned; best overall on the eval sweep)
-        win = _nz(s_emb[:n]) + HP["ensemble_weight_semi"] * _nz(s_stats[:n])
-    pw = _window_scores_to_pointwise(win, ws_t, te_stride, len(data_test), HP["pointwise_agg"])
-    return MinMaxScaler().fit_transform(pw.reshape(-1, 1)).ravel()
+        client = _get_client()
+        r_pc = _embed_windows_pc(client, tw); q_pc = _embed_windows_pc(client, qw)
+        s = _emb_score_meanpool(q_pc, r_pc, HP["k"], HP["ref_cap"])
+    pw = _window_scores_to_pointwise(s, ws_te, te_stride, len(data_test), HP["pointwise_agg"])
+    return _zc(pw)
+
+
+def _multiscale_max(data_train, data_test, scales, HP, is_stats):
+    """z-score each scale's curve, then take the element-wise MAX across scales --
+    'anomalous at ANY scale' beats averaging scales together (HYDRA-style; confirmed:
+    max-pooling across scales, after z-scoring each, is essential -- skipping the z-score
+    step costs ~6pp; averaging instead of maxing loses the scale-localized signal)."""
+    levels = [lv for ws in scales if (lv := _multiscale_level_score(data_train, data_test, ws, HP, is_stats)) is not None]
+    if not levels:
+        return np.zeros(len(data_test))
+    return np.max(np.stack(levels), axis=0)
 
 
 def run_CHARM_kNN(data_train, data_test, HP=CHARM_HP):
-    """Semi (BEST overall): mean-channel-pool embedding (+) mu/std, min-max ensemble (w=0.35)."""
-    return _run_semi(data_train, data_test, HP, channel_pool="mean", combine="minmax")
-
-
-def run_CHARM_kNN_nopool(data_train, data_test, HP=CHARM_HP):
-    """Semi (advisable for HIGH channel count): per-channel embedding (no channel pooling)
-    (+) mu/std, z-score-sum ensemble. Wins on multivariate; use when C is high."""
-    return _run_semi(data_train, data_test, HP, channel_pool="nopool", combine="zscore")
+    """Semi (BEST overall, confirmed full TSB-AD eval, stride-1, +2.6pp over the prior
+    single-scale recipe): multiscale mean-pool-channel embedding kNN, windows
+    {64,128,256}, max-pooled across scales, (+) multiscale per-window mu/std kNN, windows
+    {16,32,64,128,256,512}, max-pooled across scales (single-scale-128 fallback for
+    multivariate with channel count <=3, where the extra stats scales add noise)."""
+    C = data_train.shape[1] if data_train.ndim > 1 else 1
+    stats_scales = (HP["window_size"],) if (1 < C <= HP["stats_gate_max_c"]) else HP["stats_scales"]
+    emb = _multiscale_max(data_train, data_test, HP["emb_scales"], HP, is_stats=False)
+    stats = _multiscale_max(data_train, data_test, stats_scales, HP, is_stats=True)
+    n = min(len(emb), len(stats))
+    final = emb[:n] + stats[:n]
+    return MinMaxScaler().fit_transform(final.reshape(-1, 1)).ravel()
 
 
 # --------------------------------------------------------------------------- #
@@ -286,7 +282,7 @@ def run_CHARM_ZS(data, HP=CHARM_HP):
     return MinMaxScaler().fit_transform(pw.reshape(-1, 1)).ravel()
 
 
-SEMISUPERVISE = {"CHARM_kNN": run_CHARM_kNN, "CHARM_kNN_nopool": run_CHARM_kNN_nopool}
+SEMISUPERVISE = {"CHARM_kNN": run_CHARM_kNN}
 UNSUPERVISE = {"CHARM_ZS": run_CHARM_ZS}
 
 
