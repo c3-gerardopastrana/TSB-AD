@@ -19,15 +19,15 @@ Drop-in for benchmark_exp/ (successor to the original Run_CHARM.py). Two detecto
                   the series itself) ENSEMBLED with the per-window std, z-score-sum.
 
 Read-out: request `aggregate=False` (per-patch, per-channel) and pool client-side as max
-over time-patches then mean over channels, on the **L5** block. Per-window raw statistics
+over time-patches then mean over channels, on the **L8** block (the layer the endpoint serves). Per-window raw statistics
 recover amplitude anomalies the encoder z-normalizes away. Z-scoring each scale before the
 max is NOT optional -- skipping it costs ~6 pp VUS-PR (verified: raw-score max-pooling
 collapses without it).
 
-Official VUS-PR (TSB-AD eval, stride-1, 350 uni / 180 mv / 530 all, 0 errors):
-    CHARM_kNN : uni 0.680 / mv 0.543 / all 0.634   (best; +2.6 pp over the prior single-scale
+VUS-PR on L8 (TSB-AD eval, stride-1, 350 uni / 180 mv / 530 all, 0 errors; internal harness, full-series scoring):
+    CHARM_kNN : uni 0.678 / mv 0.539 / all 0.631   (best; +2.6 pp over the prior single-scale
                 recipe, +12.7 pp over the original Run_CHARM baseline ~0.499)
-    CHARM_ZS  : uni 0.615 / mv 0.463 / all 0.560   (zero-shot; multiscale not yet applied here)
+    CHARM_ZS  : uni 0.596 / mv 0.452 / all 0.547   (zero-shot; multiscale not yet applied here)
 The single-scale channel-pooling question (mean-pool vs per-channel/no-pool, vs concat)
 was re-tested in this multiscale setting and mean-pool won or tied everywhere once
 multiscale stats is already doing the work of catching scale-localized anomalies -- so no
@@ -52,7 +52,7 @@ CHARM_HP = {
     "stride": 1,
     "train_stride": 1,
     "min_window": 64,
-    "layer": 5,             # L5 block (assumes served model exposes it)
+    "layer": 8,             # informational: the endpoint serves the last (L8) block
     "k": 3,
     "ref_cap": 10000,       # cap kNN reference size (random subsample) for tractability
     "pointwise_agg": "mean",
@@ -149,19 +149,32 @@ def _cap_ref(ref, cap):
 
 
 # --------------------------------------------------------------------------- #
-#  Embeddings via CHARM SDK  (L5, max-over-time; channels kept separate)
+#  Embeddings via CHARM SDK  (L8, max-over-time; channels kept separate)
 # --------------------------------------------------------------------------- #
+def _create_with_retry(client, desc, ts, bs, tries=5):
+    """Call the endpoint; on a transient server error (e.g. GPU OOM) retry with a smaller batch."""
+    import time
+    for t in range(tries):
+        try:
+            return client.embeddings.create(descriptions=desc, ts_array=ts, batch_size=bs,
+                                            return_tensors="np", aggregate=False)
+        except Exception as e:
+            if t == tries - 1 or "Batch too large" in str(e):
+                raise
+            bs = max(1, bs // 2); time.sleep(2 * (t + 1))
+
+
 def _embed_windows_pc(client, windows, batch_size=4096):
     """windows (N, W, C) -> (N, C, D): aggregate=False, max over time-patches (channels kept)."""
     N, W, C = windows.shape
-    bs = max(1, batch_size // max(C, 1))
+    # server limit: batch_size * W * C <= 500,000 time points per request
+    bs = max(1, min(batch_size // max(C, 1), 500_000 // (W * max(C, 1))))
     chunk = max(bs, 2048)
     out = []
     for i in range(0, N, chunk):
         wc = np.ascontiguousarray(windows[i:i + chunk])
         desc = [[f"ch_{c}" for c in range(C)] for _ in range(len(wc))]
-        resp = client.embeddings.create(descriptions=desc, ts_array=wc.tolist(),
-                                        batch_size=bs, return_tensors="np", aggregate=False)
+        resp = _create_with_retry(client, desc, wc.tolist(), bs)
         raw = resp.embeds
         pc = raw.max(axis=1) if raw.ndim == 4 else raw[:, None, :]   # (n, C, D)
         out.append(np.nan_to_num(pc).astype(np.float32))
@@ -262,7 +275,7 @@ def run_CHARM_kNN(data_train, data_test, HP=CHARM_HP):
 #  Zero-shot runner (no train reference) — z-score ensemble
 # --------------------------------------------------------------------------- #
 def run_CHARM_ZS(data, HP=CHARM_HP):
-    """Zero-shot: bootstrap-kNN on L5 embeddings (+) per-window std, z-score-sum."""
+    """Zero-shot: bootstrap-kNN on L8 embeddings (+) per-window std, z-score-sum."""
     client = _get_client()
     ews = _effective_window(len(data), HP["window_size"], HP["stride"], HP["k"], HP["min_window"])
     if ews is None:
