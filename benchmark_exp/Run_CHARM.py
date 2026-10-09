@@ -15,7 +15,6 @@ Two detectors:
 
 Embeddings come from the CHARM endpoint (`CHARM_BASE_URL`, `CHARM_API_KEY`) with
 `aggregate=False`; patches are max-pooled over time and channels are kept separate.
-The endpoint serves the last (L8) block.
 
 Usage:
     python Run_CHARM.py --filename <series>.csv --data_dir Datasets/TSB-AD-U/ --model CHARM_kNN
