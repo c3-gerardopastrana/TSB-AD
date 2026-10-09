@@ -10,7 +10,7 @@ Two detectors:
                     (window 128 only for multivariate series with at most 3 channels)
 
   CHARM_ZS (zero-shot, no train split)
-      Bootstrap cosine kNN against a pseudo-clean reference picked by an IsolationForest
+      Bootstrap cosine kNN against a pseudo-clean reference picked by an averaged IsolationForest
       from the series itself, min-max-summed with the per-window std.
 
 Embeddings come from the CHARM endpoint (`CHARM_BASE_URL`, `CHARM_API_KEY`) with
@@ -43,6 +43,7 @@ HP = {
     "stats_gate_max_c": 3,
     "if_estimators": 200,
     "if_max_samples": 256,
+    "if_forests": 20,
     "boot_quantile": 0.70,
     "zs_std_weight": 0.40,
 }
@@ -192,20 +193,25 @@ def run_CHARM_kNN(train, test):
     return minmax(score)
 
 
+def zero_shot_score(emb, windows, ws, stride, length, n_forests=HP["if_forests"]):
+    """Score windows by kNN distance to a pseudo-clean reference (the windows an averaged
+    IsolationForest finds least suspicious), plus the per-window std."""
+    unit = unit_rows(emb)
+    suspicion = np.mean([-IsolationForest(n_estimators=HP["if_estimators"], max_samples=HP["if_max_samples"],
+                                          random_state=seed, n_jobs=4).fit(unit).score_samples(unit)
+                         for seed in range(n_forests)], axis=0)
+    ref = emb[suspicion <= np.quantile(suspicion, HP["boot_quantile"])]
+    boot = knn_score(emb, cap_ref(ref), "cosine")
+    score = minmax(boot) + HP["zs_std_weight"] * minmax(window_stats(windows)[:, 0])
+    return minmax(to_pointwise(score, ws, stride, length))
+
+
 def run_CHARM_ZS(data):
     fit = effective_window(len(data), HP["window_size"], HP["k"], HP["min_window"])
     if fit is None:
         return np.zeros(len(data))
     windows = make_windows(data, *fit)
-    emb = embed(windows).mean(1)
-    unit = unit_rows(emb)
-    forest = IsolationForest(n_estimators=HP["if_estimators"], max_samples=HP["if_max_samples"],
-                             random_state=0, n_jobs=4).fit(unit)
-    suspicion = -forest.score_samples(unit)
-    ref = emb[suspicion <= np.quantile(suspicion, HP["boot_quantile"])]
-    boot = knn_score(emb, cap_ref(ref), "cosine")
-    score = minmax(boot) + HP["zs_std_weight"] * minmax(window_stats(windows)[:, 0])
-    return minmax(to_pointwise(score, fit[0], fit[1], len(data)))
+    return zero_shot_score(embed(windows).mean(1), windows, *fit, len(data))
 
 
 DETECTORS = {"CHARM_kNN": run_CHARM_kNN, "CHARM_ZS": run_CHARM_ZS}

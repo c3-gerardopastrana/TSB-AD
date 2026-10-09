@@ -21,7 +21,7 @@ VUS-PR on the TSB-AD eval set (350 uni, 180 mv, 530 total, no failures):
 | detector | uni | mv | all |
 |---|---|---|---|
 | `CHARM_kNN` | 0.678 | 0.539 | 0.631 |
-| `CHARM_ZS` | 0.596 | 0.452 | 0.547 |
+| `CHARM_ZS` | 0.606 | 0.459 | 0.556 |
 
 Per-series scores are in `benchmark_eval_results/CHARM_{uni,multi}_mergedTable_VUS-PR.csv`.
 
@@ -42,13 +42,13 @@ VUS-PR from `Run_CHARM.py` through the API versus the table:
 
 | series | `CHARM_kNN` API / table | `CHARM_ZS` API / table |
 |---|---|---|
-| NAB_014 | 0.904 / 0.904 | 0.462 / 0.399 |
-| MSL_143 | 0.997 / 0.997 | 0.827 / 0.843 |
-| IOPS_267 | 0.310 / 0.310 | 0.303 / 0.353 |
-| YAHOO_579 | 1.000 / 1.000 | 1.000 / 1.000 |
-| YAHOO_741 | 0.616 / 0.615 | 0.567 / 0.565 |
+| NAB_014 | 0.904 / 0.904 | 0.504 / 0.560 |
+| MSL_143 | 0.997 / 0.997 | 0.817 / 0.797 |
+| IOPS_267 | 0.310 / 0.310 | 0.354 / 0.362 |
+| YAHOO_741 | 0.616 / 0.615 | 0.574 / 0.574 |
+| YAHOO_579 | 1.000 / 1.000 | |
 | YAHOO_649, YAHOO_689 | 1.000 / 1.000, 0.006 / 0.006 | |
 | Genesis (mv) | 0.930 / 0.930 | |
 | Daphnet (mv) | 0.387 / 0.388 | |
 
-`CHARM_kNN` reproduces the table. `CHARM_ZS` varies by a few points per series: its IsolationForest cut-off picks the "clean" reference windows, so tiny numeric differences in the embeddings (the score curves still correlate at 0.99+) can change the selection. Expect per-series noise of a few points; the 530-series average is stable.
+`CHARM_kNN` reproduces the table. `CHARM_ZS` picks its reference windows with an IsolationForest (averaged over 20 forests to reduce variance), and tiny numeric differences in the embeddings can still change which windows are selected, so per-series scores can differ by a few points. The 530-series average is stable.
