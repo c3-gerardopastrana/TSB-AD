@@ -51,4 +51,4 @@ VUS-PR from `Run_CHARM.py` through the API versus the table:
 | Genesis (mv) | 0.930 / 0.930 | |
 | Daphnet (mv) | 0.387 / 0.388 | |
 
-`CHARM_kNN` reproduces the table. `CHARM_ZS` varies by a few points per series because its reference set is chosen by a sampled IsolationForest.
+`CHARM_kNN` reproduces the table. `CHARM_ZS` varies by a few points per series: its IsolationForest cut-off picks the "clean" reference windows, so tiny numeric differences in the embeddings (the score curves still correlate at 0.99+) can change the selection. Expect per-series noise of a few points; the 530-series average is stable.
